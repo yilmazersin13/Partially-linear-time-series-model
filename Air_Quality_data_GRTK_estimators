@@ -1,0 +1,508 @@
+
+options(stringsAsFactors = FALSE)
+set.seed(20251220)
+
+AIR_XLSX <- "AirQualityUCI.xlsx"        # path to the dataset
+TUNING_R <- "tuning_selection.R"        # path to your tuning code
+
+OUT_DIR  <- "outputs_realdata_airquality"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Response variable
+RESPONSE_COL <- "CO(GT)"
+
+# Choose ~6 multicollinear X covariates (same p idea as simulations).
+X_COLS <- c("PT08.S1(CO)", "C6H6(GT)", "PT08.S2(NMHC)", "NOx(GT)", "PT08.S3(NOx)", "NO2(GT)")
+
+# Candidate z variables for the nonparametric component
+# (We will pick the one with the strongest nonlinearity signal.)
+Z_CANDIDATES <- c("hour", "T", "RH", "AH", "time_index")
+
+
+SCALE_X <- TRUE
+
+# Tuning grids (can keep exactly same as simulation)
+BW_SEQ <- c(seq(0.05, 0.06, by = 0.005),
+            seq(0.07, 0.1, by = 0.01),
+            seq(0.11, 0.25, by = 0.03))
+
+K_SEQ  <- c(0, 0.008, 0.009, 0.01, 0.025, 0.05, 0.10, 0.25,
+            0.50, 1, 2, 5, 10, 20)
+
+CRITERIA <- c("GCV", "AICc", "BIC", "RECP")
+
+# For paper tables we recommend focusing on one criterion 
+MAIN_CRIT <- "BIC"
+
+
+DO_ROLLING_CV <- TRUE
+TRAIN_FRAC <- 0.70
+ROLL_STEP  <- 24        
+N_ROLLS_MAX <- 10       
+
+
+
+if (!file.exists(TUNING_R)) stop("Cannot find tuning_selection.R. Put it in the same folder or change TUNING_R.")
+source(TUNING_R)
+
+
+.read_airquality_xlsx <- function(path) {
+  if (requireNamespace("readxl", quietly = TRUE)) {
+    df <- as.data.frame(readxl::read_excel(path))
+    return(df)
+  }
+  if (requireNamespace("openxlsx", quietly = TRUE)) {
+    df <- openxlsx::read.xlsx(path)
+    return(df)
+  }
+  stop("Install either 'readxl' or 'openxlsx' to read the .xlsx file.")
+}
+
+.clean_airquality <- function(df) {
+  # Replace -200 with NA in numeric columns
+  for (nm in names(df)) {
+    if (is.numeric(df[[nm]])) {
+      df[[nm]][df[[nm]] <= -199.999] <- NA
+    }
+  }
+
+  # Build datetime if Date + Time exist
+  if (all(c("Date", "Time") %in% names(df))) {
+    dt_char <- paste(df$Date, df$Time)
+    dt <- suppressWarnings(as.POSIXct(dt_char, format = "%d/%m/%Y %H:%M:%S", tz = "UTC"))
+    if (all(is.na(dt))) {
+      dt <- suppressWarnings(as.POSIXct(dt_char, format = "%m/%d/%Y %H:%M:%S", tz = "UTC"))
+    }
+    df$datetime <- dt
+  } else {
+    df$datetime <- NA
+  }
+
+  # Hour-of-day
+  if (!all(is.na(df$datetime))) {
+    hh <- as.numeric(format(df$datetime, "%H"))
+    mm <- as.numeric(format(df$datetime, "%M"))
+    df$hour <- hh + mm/60
+  } else {
+    df$hour <- NA_real_
+  }
+
+  df$time_index <- seq_len(nrow(df))
+  df
+}
+
+# --------------------------- Nonlinearity screening ---------------------------
+
+.pick_z_by_nonlinearity <- function(y, cand_list) {
+  best_name <- NULL
+  best_gain <- -Inf
+
+  for (nm in names(cand_list)) {
+    z <- cand_list[[nm]]
+    ok <- is.finite(y) & is.finite(z)
+    if (sum(ok) < 80) next
+
+    yy <- y[ok]; zz <- z[ok]
+
+    fit_lm <- lm(yy ~ zz)
+    sse_lm <- sum(residuals(fit_lm)^2)
+
+    fit_sp <- smooth.spline(zz, yy)
+    pred_sp <- predict(fit_sp, zz)$y
+    sse_sp <- sum((yy - pred_sp)^2)
+
+    sst <- sum((yy - mean(yy))^2)
+    r2_lm <- 1 - sse_lm/sst
+    r2_sp <- 1 - sse_sp/sst
+    gain <- r2_sp - r2_lm
+
+    if (is.finite(gain) && gain > best_gain) {
+      best_gain <- gain
+      best_name <- nm
+    }
+  }
+
+  list(best_name = best_name, best_gain = best_gain)
+}
+
+# -------------------------- Diagnostics plots --------------------------------
+
+.plot_corr_heatmap <- function(X, main = "Correlation among X covariates") {
+  C <- suppressWarnings(cor(X, use = "pairwise.complete.obs"))
+  C[!is.finite(C)] <- 0
+
+  image(1:ncol(C), 1:ncol(C), t(C[ncol(C):1, ]), axes = FALSE,
+        xlab = "", ylab = "", main = main)
+  axis(1, at = 1:ncol(C), labels = colnames(C), las = 2, cex.axis = 0.8)
+  axis(2, at = 1:ncol(C), labels = rev(colnames(C)), las = 2, cex.axis = 0.8)
+  box()
+
+  for (i in 1:ncol(C)) {
+    for (j in 1:ncol(C)) {
+      text(i, ncol(C) - j + 1, sprintf("%.2f", C[j, i]), cex = 0.7)
+    }
+  }
+}
+
+.plot_eigen_diagnostic <- function(X, main = "Eigenvalues of corr(X)") {
+  C <- suppressWarnings(cor(X, use = "pairwise.complete.obs"))
+  C[!is.finite(C)] <- 0
+  ev <- eigen(C, symmetric = TRUE, only.values = TRUE)$values
+  ev <- sort(ev, decreasing = TRUE)
+  plot(ev, type = "b", pch = 16, xlab = "Index", ylab = "Eigenvalue",
+       main = main)
+  abline(h = 0, lty = 3, col = "gray50")
+}
+
+make_informative_figure <- function(df, y, X, z, z_name) {
+  out_png <- file.path(OUT_DIR, "Fig_AirQuality_InformativePlots.png")
+
+  png(out_png, width = 1600, height = 1100, res = 140)
+  par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+
+  # (a) time series
+  if ("datetime" %in% names(df) && !all(is.na(df$datetime))) {
+    plot(df$datetime, y, type = "l", xlab = "Time", ylab = RESPONSE_COL,
+         main = "(a) Response time series")
+  } else {
+    plot(y, type = "l", xlab = "Index", ylab = RESPONSE_COL,
+         main = "(a) Response time series (index)")
+  }
+
+  # (b) y vs z
+  plot(z, y, pch = 16, cex = 0.5, xlab = z_name, ylab = RESPONSE_COL,
+       main = paste0("(b) Response vs z (", z_name, ")"))
+  ss <- smooth.spline(z, y)
+  lines(ss$x, ss$y, lwd = 2)
+
+  # (c) corr heatmap
+  .plot_corr_heatmap(X, main = "(c) Correlation among selected X")
+
+  # (d) eigenvalues
+  .plot_eigen_diagnostic(X, main = "(d) Eigenvalues of corr(X)")
+
+  # (e) ACF of y
+  acf(y, main = "(e) ACF of response", lag.max = 48)
+
+  # (f) histogram
+  hist(y, breaks = 30, main = "(f) Distribution of response", xlab = RESPONSE_COL)
+
+  dev.off()
+
+  cat("Saved:", out_png, "\n")
+}
+
+
+if (!file.exists(AIR_XLSX)) stop("Cannot find AirQualityUCI.xlsx. Put it in working directory or change AIR_XLSX.")
+
+df0 <- .read_airquality_xlsx(AIR_XLSX)
+df0 <- .clean_airquality(df0)
+
+if (!(RESPONSE_COL %in% names(df0))) {
+  stop(paste0("Response column '", RESPONSE_COL, "' not found. Available columns: ",
+              paste(names(df0), collapse = ", ")))
+}
+
+# Keep X that exists
+x_cols_use <- X_COLS[X_COLS %in% names(df0)]
+if (length(x_cols_use) < 3) stop("Too few X columns found. Update X_COLS list.")
+X <- as.matrix(sapply(x_cols_use, function(nm) as.numeric(df0[[nm]])))
+colnames(X) <- x_cols_use
+y <- as.numeric(df0[[RESPONSE_COL]])
+
+# Candidate z list
+cand <- list()
+if ("hour" %in% Z_CANDIDATES && "hour" %in% names(df0)) cand$hour <- as.numeric(df0$hour)
+if ("T" %in% Z_CANDIDATES && "T" %in% names(df0)) cand$T <- as.numeric(df0$T)
+if ("RH" %in% Z_CANDIDATES && "RH" %in% names(df0)) cand$RH <- as.numeric(df0$RH)
+if ("AH" %in% Z_CANDIDATES && "AH" %in% names(df0)) cand$AH <- as.numeric(df0$AH)
+if ("time_index" %in% Z_CANDIDATES && "time_index" %in% names(df0)) cand$time_index <- as.numeric(df0$time_index)
+
+pick <- .pick_z_by_nonlinearity(y, cand)
+if (is.null(pick$best_name)) stop("Could not select z (too few complete observations).")
+z_name <- pick$best_name
+z <- cand[[z_name]]
+
+# Use complete cases for (y, z, X)
+ok <- is.finite(y) & is.finite(z) & rowSums(is.finite(X)) == ncol(X)
+df <- df0[ok, , drop = FALSE]
+y  <- y[ok]
+z  <- z[ok]
+X  <- X[ok, , drop = FALSE]
+
+# Sort by time if possible
+if ("datetime" %in% names(df) && !all(is.na(df$datetime))) {
+  ord <- order(df$datetime)
+  df <- df[ord, , drop = FALSE]
+  y <- y[ord]
+  z <- z[ord]
+  X <- X[ord, , drop = FALSE]
+}
+
+# Standardize X
+if (SCALE_X) {
+  X <- scale(X)
+}
+
+# Standardize z to [0,1] for kernel stability
+z01 <- (z - min(z)) / (max(z) - min(z) + 1e-12)
+
+cat("\nAirQuality real-data setup:\n")
+cat("  n =", length(y), "\n")
+cat("  response =", RESPONSE_COL, "\n")
+cat("  X covariates (p =", ncol(X), "):", paste(colnames(X), collapse = ", "), "\n")
+cat("  selected z =", z_name, "| nonlinearity gain =", sprintf("%.4f", pick$best_gain), "\n\n")
+
+# Informative figure
+make_informative_figure(df, y, X, z, z_name)
+
+# -------------------------- Tuning: RTK vs (m)GRTK ---------------------------
+
+run_tuning_for_estimator <- function(estimator = c("RTK", "GRTK", "KS")) {
+  estimator <- match.arg(estimator)
+  if (estimator == "KS") {
+    sel <- Selection_bw_k(
+      x = X, z = z01, y = y,
+      bw_seq = BW_SEQ, k_seq = K_SEQ,
+      lag = 1,
+      criteria = CRITERIA,
+      R_mode = "I",
+      make_plots = TRUE, make_contours = TRUE,
+      save_outputs = TRUE,
+      out_dir = OUT_DIR,
+      prefix = paste0("AirQuality_", estimator, "_tuning")
+    )
+    return(sel)
+  }
+  if (estimator == "RTK") {
+    sel <- Selection_bw_k(
+      x = X, z = z01, y = y,
+      bw_seq = BW_SEQ, k_seq = K_SEQ,
+      lag = 1,
+      criteria = CRITERIA,
+      R_mode = "I",
+      make_plots = TRUE, make_contours = TRUE,
+      save_outputs = TRUE,
+      out_dir = OUT_DIR,
+      prefix = paste0("AirQuality_", estimator, "_tuning")
+    )
+    return(sel)
+  }
+  if (estimator == "GRTK") {
+    sel <- Selection_bw_k(
+      x = X, z = z01, y = y,
+      bw_seq = BW_SEQ, k_seq = K_SEQ,
+      lag = 1,
+      criteria = CRITERIA,
+      R_mode = "AR1",
+      make_plots = TRUE, make_contours = TRUE,
+      save_outputs = TRUE,
+      out_dir = OUT_DIR,
+      prefix = paste0("AirQuality_", estimator, "_tuning")
+    )
+    return(sel)
+  }
+}
+
+cat("Running tuning (this may take a few minutes)...\n")
+sel_KS   <- run_tuning_for_estimator("KS")
+sel_RTK  <- run_tuning_for_estimator("RTK")
+sel_GRTK <- run_tuning_for_estimator("GRTK")
+
+# Build tuning table
+tuning_tbl <- rbind(
+  data.frame(estimator = "KS",   Criterion = sel_KS$pairs$Criterion,   bw_hat = sel_KS$pairs$bw_hat,   k_hat = sel_KS$pairs$k_hat,   rho_hat = NA_real_),
+  data.frame(estimator = "RTK",  Criterion = sel_RTK$pairs$Criterion,  bw_hat = sel_RTK$pairs$bw_hat,  k_hat = sel_RTK$pairs$k_hat,  rho_hat = NA_real_),
+  data.frame(estimator = "GRTK", Criterion = sel_GRTK$pairs$Criterion, bw_hat = sel_GRTK$pairs$bw_hat, k_hat = sel_GRTK$pairs$k_hat, rho_hat = sel_GRTK$rho_hat)
+)
+
+write.csv(tuning_tbl, file.path(OUT_DIR, "Table_realdata_tuning_pairs.csv"), row.names = FALSE)
+cat("Saved Table_realdata_tuning_pairs.csv\n")
+
+# ---------------------------- Fit models (MAIN_CRIT) --------------------------
+
+get_pair <- function(sel, crit) {
+  row <- sel$pairs[sel$pairs$Criterion == crit, ]
+  list(bw = as.numeric(row$bw_hat[1]), k = as.numeric(row$k_hat[1]))
+}
+
+pair_KS   <- get_pair(sel_KS, MAIN_CRIT)
+pair_RTK  <- get_pair(sel_RTK, MAIN_CRIT)
+pair_GRTK <- get_pair(sel_GRTK, MAIN_CRIT)
+
+# Fit under each estimator
+n <- length(y)
+
+fit_KS <- fit_plm_once(X, z01, y, bw = pair_KS$bw, k = 0, Rinv = diag(n))
+fit_RTK <- fit_plm_once(X, z01, y, bw = pair_RTK$bw, k = pair_RTK$k, Rinv = diag(n))
+
+# For GRTK, build AR1 working correlation using estimated rho_hat from selection
+rho_hat <- as.numeric(sel_GRTK$rho_hat)
+R <- AR1_corr_matrix(n, rho_hat)
+Rinv <- safe_chol_inv(R)
+fit_GRTK <- fit_plm_once(X, z01, y, bw = pair_GRTK$bw, k = pair_GRTK$k, Rinv = Rinv)
+
+# Performance table (full sample)
+resid_acf1 <- function(res) {
+  aa <- acf(res, plot = FALSE, lag.max = 1)$acf
+  as.numeric(aa[2])
+}
+
+perf_tbl <- data.frame(
+  estimator = c("KS", "RTK", "GRTK"),
+  criterion = MAIN_CRIT,
+  bw_hat = c(pair_KS$bw, pair_RTK$bw, pair_GRTK$bw),
+  k_hat  = c(0, pair_RTK$k, pair_GRTK$k),
+  rho_hat = c(NA_real_, NA_real_, rho_hat),
+  RSS = c(sum((y - fit_KS$yhat)^2), sum((y - fit_RTK$yhat)^2), sum((y - fit_GRTK$yhat)^2)),
+  resid_acf1 = c(resid_acf1(y - fit_KS$yhat), resid_acf1(y - fit_RTK$yhat), resid_acf1(y - fit_GRTK$yhat))
+)
+
+write.csv(perf_tbl, file.path(OUT_DIR, "Table_realdata_performance_fullsample.csv"), row.names = FALSE)
+cat("Saved Table_realdata_performance_fullsample.csv\n")
+
+# ---------------------------- Coefficient table -------------------------------
+
+# Var(beta_hat) ≈ sigma^2 (A^{-1} (XtRinvXt) A^{-1})
+# where A = XtRinvXt + k I.
+.compute_beta_se <- function(fit, Rinv, k) {
+  xtil <- fit$xtil
+  XtRinvXt <- crossprod(xtil, Rinv %*% xtil)
+  p <- ncol(xtil)
+  A <- XtRinvXt + k * diag(p)
+
+  # df approximation
+  df <- df_fast(fit$W, fit$Iw, xtil, A, Rinv)
+  df_res <- max(5, nrow(xtil) - df)
+
+  res <- y - fit$yhat
+  sigma2 <- sum(res^2) / df_res
+
+  V <- sigma2 * solve(A, XtRinvXt) %*% solve(A)
+  se <- sqrt(pmax(0, diag(V)))
+  list(se = se, sigma2 = sigma2, df = df, df_res = df_res)
+}
+
+se_RTK  <- .compute_beta_se(fit_RTK, diag(n), pair_RTK$k)
+se_GRTK <- .compute_beta_se(fit_GRTK, Rinv, pair_GRTK$k)
+
+beta_tbl <- data.frame(
+  covariate = colnames(X),
+  beta_RTK  = as.numeric(fit_RTK$beta_hat),
+  se_RTK    = as.numeric(se_RTK$se),
+  t_RTK     = as.numeric(fit_RTK$beta_hat) / pmax(1e-12, as.numeric(se_RTK$se)),
+  beta_GRTK = as.numeric(fit_GRTK$beta_hat),
+  se_GRTK   = as.numeric(se_GRTK$se),
+  t_GRTK    = as.numeric(fit_GRTK$beta_hat) / pmax(1e-12, as.numeric(se_GRTK$se))
+)
+
+beta_tbl$p_RTK  <- 2 * (1 - pt(abs(beta_tbl$t_RTK),  df = max(5, round(se_RTK$df_res))))
+beta_tbl$p_GRTK <- 2 * (1 - pt(abs(beta_tbl$t_GRTK), df = max(5, round(se_GRTK$df_res))))
+
+write.csv(beta_tbl, file.path(OUT_DIR, "Table_realdata_coeff_significance.csv"), row.names = FALSE)
+cat("Saved Table_realdata_coeff_significance.csv\n")
+
+# ---------------------------- fhat and residual ACF figures -------------------
+
+# (1) fhat vs z
+png(file.path(OUT_DIR, "Fig_realdata_fhat_vs_z.png"), width = 1200, height = 800, res = 140)
+plot(z, fit_GRTK$fhat, pch = 16, cex = 0.4, xlab = z_name, ylab = expression(hat(f)(z)),
+     main = paste0("Estimated nonparametric component under ", MAIN_CRIT, " (AirQuality)"))
+lines(smooth.spline(z, fit_KS$fhat)$x, smooth.spline(z, fit_KS$fhat)$y, lwd = 2, lty = 2)
+lines(smooth.spline(z, fit_RTK$fhat)$x, smooth.spline(z, fit_RTK$fhat)$y, lwd = 2, lty = 3)
+lines(smooth.spline(z, fit_GRTK$fhat)$x, smooth.spline(z, fit_GRTK$fhat)$y, lwd = 2, lty = 1)
+legend("topright", legend = c("KS", "RTK", "GRTK"), lty = c(2,3,1), lwd = 2, bty = "n")
+dev.off()
+cat("Saved Fig_realdata_fhat_vs_z.png\n")
+
+# (2) Residual ACF comparison
+png(file.path(OUT_DIR, "Fig_realdata_residual_acf_compare.png"), width = 1200, height = 800, res = 140)
+par(mfrow = c(3, 1), mar = c(4, 4, 3, 1))
+acf(y - fit_KS$yhat,  main = "Residual ACF: KS",  lag.max = 48)
+acf(y - fit_RTK$yhat, main = "Residual ACF: RTK", lag.max = 48)
+acf(y - fit_GRTK$yhat,main = "Residual ACF: GRTK",lag.max = 48)
+dev.off()
+cat("Saved Fig_realdata_residual_acf_compare.png\n")
+
+
+if (DO_ROLLING_CV) {
+  cat("Running rolling-origin evaluation...\n")
+
+  N <- length(y)
+  n_train0 <- floor(TRAIN_FRAC * N)
+
+  # rolling windows: expanding training set, fixed test block of size ROLL_STEP
+  starts <- seq(n_train0, min(N - ROLL_STEP, n_train0 + (N_ROLLS_MAX-1)*ROLL_STEP), by = ROLL_STEP)
+
+  rmse <- function(a, b) sqrt(mean((a - b)^2))
+
+  roll_rows <- list()
+  rr <- 1L
+
+  for (s in starts) {
+    idx_tr <- 1:s
+    idx_te <- (s+1):(s+ROLL_STEP)
+
+    y_tr <- y[idx_tr]; X_tr <- X[idx_tr, , drop = FALSE]; z_tr <- z01[idx_tr]
+    y_te <- y[idx_te]; X_te <- X[idx_te, , drop = FALSE]; z_te <- z01[idx_te]
+
+    # For speed & compactness, keep tuning fixed to full-sample MAIN_CRIT pairs.
+    # (If you want re-tuning per roll, we can do it, but it becomes heavy.)
+    ntr <- length(y_tr)
+
+    # KS / RTK (independence)
+    fitKS_tr  <- fit_plm_once(X_tr, z_tr, y_tr, bw = pair_KS$bw, k = 0, Rinv = diag(ntr))
+    fitRTK_tr <- fit_plm_once(X_tr, z_tr, y_tr, bw = pair_RTK$bw, k = pair_RTK$k, Rinv = diag(ntr))
+
+    # GRTK: estimate rho on training residuals using a pilot fit (working I)
+    pilot_tr <- fit_plm_once(X_tr, z_tr, y_tr, bw = median(BW_SEQ), k = median(K_SEQ[K_SEQ>0]), Rinv = diag(ntr))
+    rho_tr <- estimate_rho_ar1(y_tr - pilot_tr$yhat, lag = 1)
+    Rtr <- AR1_corr_matrix(ntr, rho_tr)
+    Rtr_inv <- safe_chol_inv(Rtr)
+    fitGRTK_tr <- fit_plm_once(X_tr, z_tr, y_tr, bw = pair_GRTK$bw, k = pair_GRTK$k, Rinv = Rtr_inv)
+
+    gaussian_kernel <- function(u) exp(-0.5 * u^2)
+    W_te_tr <- function(z_te, z_tr, bw) {
+      D <- outer(z_te, z_tr, "-") / bw
+      K <- gaussian_kernel(D)
+      rs <- rowSums(K) + 1e-12
+      K / rs
+    }
+
+    pred_from_fit <- function(beta_hat, y_tr, X_tr, z_tr, X_te, z_te, bw) {
+      W <- W_te_tr(z_te, z_tr, bw)
+      yhat_te <- as.vector(W %*% y_tr + (X_te - W %*% X_tr) %*% beta_hat)
+      yhat_te
+    }
+
+    yhat_KS  <- pred_from_fit(fitKS_tr$beta_hat,  y_tr, X_tr, z_tr, X_te, z_te, pair_KS$bw)
+    yhat_RTK <- pred_from_fit(fitRTK_tr$beta_hat, y_tr, X_tr, z_tr, X_te, z_te, pair_RTK$bw)
+    yhat_GRTK<- pred_from_fit(fitGRTK_tr$beta_hat,y_tr, X_tr, z_tr, X_te, z_te, pair_GRTK$bw)
+
+    roll_rows[[rr]] <- data.frame(
+      roll_id = rr,
+      train_end = s,
+      test_start = s+1,
+      test_end = s+ROLL_STEP,
+      RMSE_KS = rmse(y_te, yhat_KS),
+      RMSE_RTK = rmse(y_te, yhat_RTK),
+      RMSE_GRTK = rmse(y_te, yhat_GRTK),
+      rho_hat_train = rho_tr
+    )
+    rr <- rr + 1L
+  }
+
+  roll_df <- do.call(rbind, roll_rows)
+  write.csv(roll_df, file.path(OUT_DIR, "Table_realdata_rollingCV_RMSE.csv"), row.names = FALSE)
+
+  roll_mean <- data.frame(
+    RMSE_KS_mean = mean(roll_df$RMSE_KS),
+    RMSE_RTK_mean = mean(roll_df$RMSE_RTK),
+    RMSE_GRTK_mean = mean(roll_df$RMSE_GRTK)
+  )
+  write.csv(roll_mean, file.path(OUT_DIR, "Table_realdata_rollingCV_RMSE_mean.csv"), row.names = FALSE)
+
+  cat("Saved rolling CV tables.\n")
+}
+
+cat("\nDONE. Outputs written to:", OUT_DIR, "\n")
