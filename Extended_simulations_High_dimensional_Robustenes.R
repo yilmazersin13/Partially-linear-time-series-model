@@ -12,7 +12,7 @@ dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
 
 USE_PARALLEL <- TRUE
 N_CORES <- 3
-B <- 20
+B <- 1000 #we can try B=100 to see results quickly
 
 BW_SEQ <- c(seq(0.005, 0.05, by = 0.005), seq(0.06, 0.25, by = 0.02))
 K_SEQ  <- c(0, 0.001, 0.005, 0.01, 0.025, 0.05, 0.10, 0.25,
